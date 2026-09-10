@@ -94,10 +94,49 @@ class W8A8PT2EQuantizer(Quantizer):
         """
         fold_quantize = kwargs.get("fold_quantize", False)
         converted_model = convert_pt2e(model, fold_quantize=fold_quantize)
+        self._ensure_quantization_inputs_fp32(converted_model)
         logger.warning("Converted the model in qdq mode, please compile it to accelerate inference.")
         if self.quant_config:
             self.half_precision_transformation(converted_model, self.quant_config)
         return converted_model
+
+    @staticmethod
+    def _ensure_quantization_inputs_fp32(model: GraphModule) -> None:
+        """Cast floating-point inputs to quantization operators to FP32.
+
+        TorchInductor's quantize-per-tensor and quantize-per-channel lowerings
+        require FP32 input. Exported models loaded in half precision can
+        otherwise pass FP16 activations or weights to these operators, which
+        fails during compilation on newer Torch versions.
+        The cast is inserted only for non-FP32 floating-point inputs, preserving
+        the original graph for FP32 models.
+        """
+        graph = model.graph
+        modified = False
+        quantize_ops = {
+            torch.ops.quantized_decomposed.quantize_per_tensor.default,
+            torch.ops.quantized_decomposed.quantize_per_channel.default,
+        }
+        for node in list(graph.nodes):
+            if node.op != "call_function" or node.target not in quantize_ops or not node.args:
+                continue
+            input_node = node.args[0]
+            input_value = input_node.meta.get("val") if hasattr(input_node, "meta") else None
+            if not isinstance(input_value, torch.Tensor):
+                continue
+            if not torch.is_floating_point(input_value) or input_value.dtype == torch.float32:
+                continue
+            with graph.inserting_before(node):
+                input_fp32 = graph.call_function(
+                    torch.ops.aten._to_copy.default,
+                    (input_node,),
+                    {"dtype": torch.float32},
+                )
+            node.args = (input_fp32, *node.args[1:])
+            modified = True
+        if modified:
+            graph.eliminate_dead_code()
+            model.recompile()
 
     def half_precision_transformation(self, model, config):
         """Applies half-precision transformation to the given model in-place.
